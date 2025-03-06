@@ -1,0 +1,286 @@
+---
+title: "Multiple imputation"
+author: "Q Yun"
+date: "April 2024"
+output:
+  pdf_document: default
+  fig_caption: yes
+  word_document: default
+  html_document:
+    df_print: paged
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+## 1. The data
+In order to investigate the performance of the MICE package (van Buuren and Groothuis-Oudshoorn, 2011) and multiple imputation approach, the Boston Housing data in the MASS package (Venables and Ripley, 2002) will be used in this experiment. This dataset, with a total of 506 cases, contains information about the housing values in the suburbs of Boston MA area. There are 14 variables, which are crim, zn, indus, chas, nox, rm, age, dis, rad, tax, ptratio, black, lstat and medv (detailed description of the variables is available in RStudio) in the dataset, and it doesn't contain any missing data.
+```{r loading}
+library(tidyverse)
+library(mice)
+library(MASS)
+library(dplyr)
+library(ggmice)
+data("Boston")
+```
+```{r, eval=FALSE}
+sum(is.na(Boston))
+```
+Among the variables, _chas_ is binary consisting of values of 1 and 0, and other variables are continuous with the exception of _zn_ and _rad_ being discrete. However, it is worth noting that many of them are ratio data, and none of the variables contains any negative values. An extract of the data is shown in table 1. 
+```{r, echo=FALSE, message=FALSE, fig.cap='Extract of the Boston housing data', fig.align='center'}
+knitr::kable(slice_sample(Boston, n=4), caption = 'Extract of the Boston housing dataset')
+```
+## 2.The model
+The main interest of our model is how the _medv_ variable, which is the median house prices, can be predicted by other covariates, therefore _medv_ is the dependent variable. While some covariates appear to be highly correlated in an initial analysis of the data, we include them all as the explanatory variables, for they might be useful in the multiple imputation of the missing data. However the possible interactions among them are not considered. The model can be expressed as
+\[
+y = \beta_0 + \beta_1x_1 + \beta_2x_2 + \beta_3x_3 + \beta_4x_4 + \beta_5x_5 + ... + \beta_{12}x_{12} + \beta_{13}x_{13} + \epsilon 
+\]
+with $y$ being the _medv_ variable, $x_{1}$ to $x_{13}$ being the explanatory variables of _crim_, _zn_, _indus_, _chas_, _nox_, _rm_, _age_, _dis_, _rad_, _tax_, _ptratio_, _black_, and _lstat_ respectively. We fit this model and obtain the following estimates (Table 2) as the benchmark in assessing the performance of different multiple imputations.
+```{r, eval=FALSE}
+cor(Boston)
+```
+```{r benchmark}
+lm_model_bch <- lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat, data=Boston)
+knitr::kable(summary(lm_model_bch)$coefficients, caption = 'Estimates of coefficients in the benchmark model')
+```
+```{r creating modified data}
+set.seed(1070)
+makeMissing <- function(bostondf, probMissing){
+  R <- matrix(rbinom(nrow(bostondf) * ncol(bostondf),
+                     1,
+                     probMissing),
+              nrow = nrow(bostondf),
+              ncol = ncol(bostondf))
+  bostondf[R == 1] <- NA
+  bostondf 
+}
+bostondf <- makeMissing(Boston, 0.01)
+```
+
+## 3. Exploratory data analysis
+```{r, eval=FALSE}
+summary(bostondf)
+```
+```{r, fig.cap='Missing pattern of the first dataset (missing 1% values)', fig.pos='H'}
+plot_pattern(bostondf, rotate = TRUE)
+```
+
+We randomly assign 1% of the values in the dataset with NA, creating the first modified dataset for our exploratory analysis. For any dataset with missing data, it is essential to analyse the missing pattern to check if it is appropriate to implement multiple imputation. Although it is usually fine to implement it for the MCAR (missing completely at random) and MAR (missing at random) cases, it may be problematic for the NMAR (not missing at random) cases.
+
+As can be seen in Figure 1, in this modified dataset with 1% missing data, 444 observations are fully complete, representing 87.7% of the data. The largest proportion, 8 records representing about 1.6% of the data, misses only the values for the variable of _dis_, and there are another 8 records with the value of _nox_ missing. There are only 6 records with two variables missing, so it seems that the missingness of one variable is not linked to the missingness of any other variable. The majority of records with missing data, 10 records representing about 2% of the data, do not have information on the variable of _dis_.
+
+If we had no idea about the missingness of this dataset, we may want to explore whether the missingness of _dis_ (weighted distances to five Boston employment centres), is related to _rad_ (index of accessibility to radial highway) by plotting a histogram of _rad_, split by whether _dis_ is missing or not.
+```{r, fig.cap='Exploring the relationship of missingness of rad to dis', out.width='50%', fig.align='center'}
+bostondf$R <- is.na(bostondf$dis)
+ggplot(bostondf, aes(x = rad, na.rm = TRUE)) +
+   geom_histogram(aes(y = ..density..), binwidth = 0.5) +
+   facet_wrap(~ R)
+```
+From the above histograms (Figure 2), the distributions of _rad_ appear to similar whether _dis_ is missing or not, which indicates that the missingness of _dis_ is not linked to _rad_.
+
+## 4.Method
+We introduce three different proportions of missingness (1%, 10%, 20%) to the data, creating three datasets for our experiments. For each dataset, two different built-in imputation methods in the mice package (Burren and Groothuis-Oudshoorn, 2011) are implemented for the comparison of their coefficients estimates. Certain built-in method in MICE, such as norm, might not be appropriate for this dataset when we consider that some variables are binary and some others, such as _indus_, _age_ and _lstat_, are percentages. In addition, none of the variables contain any negative values. For the number of imputations, as higher percentage of missingness tends to require more iterations, we generally follow the recommendation that the amount of iterations should be at least equal to the percentage of missing observations (White et al.,2011). The experiment will be carried out in the following steps:
+
+1. Generate three datasets, each with a different proportion of missingness (1%, 10% and 20% respectively) by randomly assigning certain values to NA;
+2. Carry out a complete case analysis on each dataset;
+3. For each dataset, use MICE package to carry out the multiple imputation with two methods, the predictive mean matching (PMM) and the classification and regression trees (CART) with a certain number of iterations. Check the convergence of the algorithm and the feasibility of imputed data before the pooled analysis.
+4. Treat the coefficients from each pooled analysis as a vector, and then compare them to the results of the complete case analysis against the benchmark by using the idea of Euclidean distance. The estimates with the shorter distance is a better estimate.
+
+## 5.Convergence of the MICE algorithm
+For the first dataset with 1% missing data, we use MICE to generate 10 datasets with 5 iterations, by firstly using the PMM method, and investigate the convergence of the algorithm.
+
+```{r, eval = TRUE}
+# remove the created R column first
+bostondf <- subset(bostondf, select = -R)
+bostondf_imp_pmm5 <- mice(bostondf, m = 10, maxit = 5, method = 'pmm', print = F)
+bostondf_imp_cart5 <- mice(bostondf, m = 10, maxit = 5, method = 'cart', print = F)
+```
+```{r, eval= TRUE, fig.show="hold", out.width="35%", fig.cap='The mean and standard deviation of missing variables over the internal iterations of the MICE algorithm'}
+plot(bostondf_imp_pmm5)
+```
+
+```{r, eval = FALSE}
+plot(bostondf_imp_cart5)
+```
+```{r, eval= F}
+# We also have a look at the summary of some imputed datasets 
+dat <- complete(bostondf_imp_pmm5, 1)
+summary(dat)
+dat <- complete(bostondf_imp_cart5, 3)
+summary(dat)
+stripplot(bostondf_imp_pmm5, medv + crim ~ .imp, pch = 20, cex = 2)
+stripplot(bostondf_imp_cart5, medv + crim ~ .imp, pch = 20, cex = 2)
+```
+```{r, eval=TRUE, fig.cap='Strip plot of imputed variables of medv and crim (the observed data is shown in blue and imputed data in red)', out.width='40%', fig.align='center'}
+mice::stripplot(bostondf_imp_pmm5, medv + crim ~ .imp, pch = 20, cex = 2)
+```
+By plotting the imputed data (see Figure 3), 5 iterations already converge nicely for this small percentage of missingness (further analysis for the CART method also shows convergence). We then examine if the imputed data is plausible by looking at the summary of a couple of imputed datasets, particularly the minimum and maximum values, for an initial analysis, and they appear to be satisfactory. Another examination by using stripplot (by checking the imputed value for _mediv_ and _crim_) also seems to support that the imputed data are plausible (see Figure 4).
+```{r, eval=FALSE, fig.cap='Plot of imputed and observed data: distributions are similar', out.width='70%'}
+densityplot(bostondf_imp_pmm5)
+```
+```{r, eval=FALSE}
+densityplot(bostondf_imp_cart5)
+```
+## 6. Results
+Since the imputed data are plausible and the algorithm converges nicely, we use the imputed data for our model and pool the analysis together, then compare them to the benchmark by calculating the Euclidean distance, with the same analysis being applied to the results of the complete case analysis.
+```{r, include=FALSE}
+CalEuclidean <- function(vect1, vect2) sqrt(sum((vect1 - vect2)^2))
+vect_bh <- summary(lm_model_bch)$coefficients[,1]
+bt_pmm5_fit <- with(bostondf_imp_pmm5, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_pmm5_pool <- pool(bt_pmm5_fit)
+
+vect_pm5 <- bt_pmm5_pool$pooled[, 3] 
+
+bt_cart5_fit <- with(bostondf_imp_cart5, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_cart5_pool <- pool(bt_cart5_fit)
+vect_ct5 <- bt_cart5_pool$pooled[, 3]
+ed_pm_5 <- CalEuclidean(vect_bh, vect_pm5)
+ed_ct_5 <- CalEuclidean(vect_bh, vect_ct5)
+```
+
+```{r, include=FALSE}
+lm_model5_cc <- lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat, data=bostondf)
+vect_cc5<-summary(lm_model5_cc)$coefficients[,1]
+ed_cc_5 <- CalEuclidean(vect_bh, vect_cc5)
+```
+By following the same steps, we generate two more datasets with 10% and 20% respectively for our analysis. For these two percentages of missingness, we increase the number of iteration in the MICE imputation to 30 and 45 times respectively. After checking the convergence of the algorithms and the distribution of imputed data, we decide to apply the imputed data to our model for pooled analysis as well.
+```{r, include=FALSE}
+set.seed(10010)
+bostondf10 <- makeMissing(Boston, 0.10)
+bostondf20 <- makeMissing(Boston, 0.20)
+summary(bostondf10)
+summary(bostondf20)
+```
+```{r, include=FALSE}
+bostondf_imp_pmm10<- mice(bostondf, m = 10, maxit = 30, method = 'pmm', print = F)
+bostondf_imp_cart10 <- mice(bostondf, m = 10, maxit = 30, method = 'cart', print = F)
+
+plot(bostondf_imp_pmm10)
+plot(bostondf_imp_cart10)
+densityplot(bostondf_imp_pmm10)
+densityplot(bostondf_imp_cart10)
+```
+
+```{r, include=FALSE}
+bostondf_imp_pmm20<- mice(bostondf, m = 10, maxit = 45, method = 'pmm', print = F)
+bostondf_imp_cart20 <- mice(bostondf, m = 10, maxit = 45, method = 'cart', print = F)
+plot(bostondf_imp_pmm20)
+plot(bostondf_imp_cart20)
+densityplot(bostondf_imp_pmm20)
+densityplot(bostondf_imp_cart20)
+```
+
+```{r, include=FALSE}
+# complete case analysis
+lm_model10_cc <- lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat, data=bostondf10)
+vect_cc10 <- summary(lm_model10_cc)$coefficients[,1]
+ed_cc_10 <- CalEuclidean(vect_bh, vect_cc10)
+
+lm_model20_cc <- lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat, data=bostondf20)
+vect_cc20 <- summary(lm_model20_cc)$coefficients[,1]
+ed_cc_20 <- CalEuclidean(vect_bh, vect_cc20)
+
+# imputation and pooled analysis
+bt_pmm10_fit <- with(bostondf_imp_pmm10, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_pmm10_pool <- pool(bt_pmm10_fit)
+vect_pm10 <- bt_pmm10_pool$pooled[, 3]
+
+bt_cart10_fit <- with(bostondf_imp_cart10, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_cart10_pool <- pool(bt_cart10_fit)
+vect_ct10 <- bt_cart10_pool$pooled[, 3]
+
+bt_pmm20_fit <- with(bostondf_imp_pmm20, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_pmm20_pool <- pool(bt_pmm20_fit)
+vect_pm20 <- bt_pmm20_pool$pooled[, 3]
+
+bt_cart20_fit <- with(bostondf_imp_cart20, lm(medv~crim + zn + indus + chas + nox + rm + age + dis + rad + tax + ptratio + black + lstat))
+bt_cart20_pool <- pool(bt_cart20_fit)
+vect_ct20 <- bt_cart20_pool$pooled[, 3]
+
+# Euclidean distance
+ed_pm_10 <- CalEuclidean(vect_bh, vect_pm10)
+ed_ct_10 <- CalEuclidean(vect_bh, vect_ct10)
+ed_pm_20 <- CalEuclidean(vect_bh, vect_pm20)
+ed_ct_20 <- CalEuclidean(vect_bh, vect_ct20)
+```
+
+```{r}
+missingness_percent <- c("5%", "10%", "20%")
+Euclidean_complete_case <- c(ed_cc_5, ed_cc_10, ed_cc_20)
+Euclidean_pmm <- c(ed_pm_5, ed_pm_10, ed_pm_20)
+Euclidean_cart <- c(ed_ct_5, ed_ct_10, ed_ct_20)
+# create a dataframe for the comparison
+euclidean <- data.frame(missingness_percent, Euclidean_complete_case, Euclidean_pmm, Euclidean_cart)
+knitr::kable(euclidean, caption = 'Euclidean distance of different imputations to the benchmark for data with different percentage of missingness')
+```
+It can be seen from Table 3, when the percentage of missingness is low, there isn't much difference between the Euclidean distances of the three analyses, and the complete case analysis is satisfactory. However, when this percentage increases to 10% or 20%, complete case analysis performed rather poorly, while the performance of the two imputation methods is far more stable, showing their superiority over complete case analysis. Between the PMM and CART methods, the Euclidean distance of CART method seems to perform a bit better than the PMM method for our data. 
+
+In order to check if the results of pooled analysis are satisfactory, we also need to check the _lambda_ (proportion of variance due to the missing data) and _fmi_ (fraction of missing information) to see the impact of missing data and mutliple imputations on the variance of the estimates. The maximum values of _lambda_ and _fmi_ in Table 4 suggest that most of them are under 0.08, although the values for the PMM method fall between 0.12 to 0.16 when the percentage of missingness increases to 10% and 20%, which also seems to suggest that the CART method works better for our data.
+```{r, include=FALSE}
+bt_pmm5_pool$pooled
+bt_cart5_pool$pooled
+bt_pmm10_pool$pooled
+bt_cart10_pool$pooled
+bt_pmm20_pool$pooled
+bt_cart20_pool$pooled
+```
+```{r}
+bt_pmm5_lam <- max(bt_pmm5_pool$pooled$lambda)
+bt_pmm5_fmi <- max(bt_pmm5_pool$pooled$fmi)
+bt_pmm10_lam <- max(bt_pmm10_pool$pooled$lambda)
+bt_pmm10_fmi <- max(bt_pmm10_pool$pooled$fmi)
+bt_pmm20_lam <- max(bt_pmm20_pool$pooled$lambda)
+bt_pmm20_fmi <- max(bt_pmm20_pool$pooled$fmi)
+
+bt_cart5_lam <- max(bt_cart5_pool$pooled$lambda)
+bt_cart5_fmi <- max(bt_cart5_pool$pooled$fmi)
+bt_cart10_lam <- max(bt_cart10_pool$pooled$lambda)
+bt_cart10_fmi <- max(bt_cart10_pool$pooled$fmi)
+bt_cart20_lam <- max(bt_cart20_pool$pooled$lambda)
+bt_cart20_fmi <- max(bt_cart20_pool$pooled$fmi)
+
+pmm_lambda <- c(bt_pmm5_lam, bt_pmm10_lam, bt_pmm20_lam)
+pmm_fmi <- c(bt_pmm5_fmi, bt_pmm10_fmi, bt_pmm20_fmi)
+cart_lambda <- c(bt_cart5_lam, bt_cart10_lam, bt_cart20_lam)
+cart_fmi <- c(bt_cart5_fmi, bt_cart10_fmi, bt_cart20_fmi)
+
+lam_fmi <- data.frame(missingness_percent, pmm_lambda, pmm_fmi, cart_lambda, cart_fmi)
+knitr::kable(lam_fmi, caption = 'Maximum value of lambda and fmi in different imputations')
+```
+
+
+## 7. Conclusion
+From our experiment, it can be seen that multiple imputation in MICE performs much better than the complete case analysis, particularly when the percentage of missingness increases. The variance of coefficient estimates due to the missing data and imputation remains fairly stable during the pooled imputation analysis. Therefore, multiple imputation is recommended for the analysis of missing data of MAR or MCAR cases, although we should bear in mind that the amount of iteration needs to increase when the percentage of missingness increases and different imputation methods may performs differently.
+
+
+## 8.References
+  Allaire J, Xie Y and Dervieux C, et al. (2023). _rmarkdown: Dynamic Documents for R_. R package
+  version 2.25, <https://github.com/rstudio/rmarkdown>.
+  
+  Oberman H (2023). _ggmice: Visualizations for 'mice' with 'ggplot2'_. R package
+  version 0.1.0, <https://CRAN.R-project.org/package=ggmice>.
+  
+  R Core Team (2023). _R: A Language and Environment for Statistical Computing_. R
+  Foundation for Statistical Computing, Vienna, Austria. <https://www.R-project.org/>.
+  
+  Venables, W. N. & Ripley, B. D. (2002) Modern Applied
+  Statistics with S. Fourth Edition. Springer, New York. ISBN
+  0-387-95457-0
+  
+  van Buuren,Stef and Groothuis-Oudshoorn, Karin (2011). mice:
+  Multivariate Imputation by Chained Equations in R. Journal
+  of Statistical Software, 45(3), 1-67. DOI
+  10.18637/jss.v045.i03.
+  
+  Wickham H, Averick M, and Bryan J et al (2019). “Welcome
+  to the tidyverse.” _Journal of Open Source Software_, *4*(43), 1686.
+  doi:10.21105/joss.01686 <https://doi.org/10.21105/joss.01686>.
+  
+  Wickham H, François R, Henry L, Müller K, Vaughan D (2023). _dplyr: A Grammar of Data Manipulation_.
+  R package version 1.1.4, <https://CRAN.R-project.org/package=dplyr>.
+  
+  White IR, Royston P, Wood AM. Multiple imputation using chained equations: Issues and guidance for practice. Stat Med. 2011;30(4):377–399. doi: 10.1002/sim.4067.
+
+  
+
