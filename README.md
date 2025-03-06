@@ -1,2 +1,5 @@
-# Multiple imputation with MICE package (R language) 
-Currently it contains a R markdown file and a html file.
+# Multiple imputation experiment with MICE package (R language) 
+It contains three versions of the experiment:
+- a R markdown file
+- a html file (with R code)
+- a pdf (without R code)
